@@ -120,20 +120,21 @@ def _should_use_packed(seq_lens: list[int], H: int, chunk: int) -> bool:
 # revert to the inline body for A/B.
 _DISABLE_COMPILE = bool(int(os.environ.get("MLX_KDA_DISABLE_COMPILE", "0") or "0"))
 
-# Opt-in Metal-kernel replacement for the single-sequence per-chunk body
-# (plan PR E Phase 2c + Phase 3). M3+ only; skipped on older hardware via
-# _metal_recurrence.HAS_METAL_KERNEL auto-detect.
+# Opt-in Metal-kernel replacement for the per-chunk recurrence body.
+# M3+ only; skipped on older hardware via _metal_recurrence.HAS_METAL_KERNEL
+# auto-detect.
 #
-# MLX_KDA_ENABLE_METAL_RECURRENCE values:
-#   "0" | "" | "off"       : Python + mx.compile per-chunk body (baseline)
-#   "1" | "simdgroup"      : Phase 3b cross-chunk simdgroup kernel (DEFAULT)
-#   "per-chunk"            : Phase 2 fused per-chunk Metal kernel (alternate)
-#   "scalar"               : Phase 3a cross-chunk scalar kernel (alternate)
+# MLX_KDA_ENABLE_METAL_RECURRENCE values (production envelope after the
+# 2026-04-30 cleanup; see plan.md §8.3 for the historical Phase 2
+# per-chunk layer that was retired once Phase 3 superseded it):
 #
-# Phase 3c A/B data picked simdgroup as the default — it beats per-chunk
-# by 1.16–1.44× and scalar by 1.16–1.35× across all bench-scale cases
-# on M3 Max (see plan.md §13). Per-chunk and scalar stay
-# reachable so the decision can be revisited on future hardware.
+#   "0" | "" | "off"  : Python + mx.compile per-chunk body (baseline)
+#   "1" | "simdgroup" : Phase 3b cross-chunk simdgroup kernel (DEFAULT)
+#   "scalar"          : Phase 3a cross-chunk scalar kernel — kept as a
+#                       future-hardware A/B anchor (mlx-lm's own
+#                       gated_delta_kernel chose scalar+simd_sum over
+#                       simdgroup_matrix; on chips where that calculus
+#                       differs, scalar can win).
 #
 # The cross-chunk modes collapse the entire chunk loop for a sequence into
 # ONE Metal dispatch per head. They require CHUNK=16 (hardcoded simdgroup
@@ -146,8 +147,6 @@ _METAL_MODE_ALIASES = {
     "false": "off",
     "1": "simdgroup",       # Phase 3c: winner of the A/B is the default
     "simdgroup": "simdgroup",
-    "per-chunk": "per_chunk",
-    "per_chunk": "per_chunk",
     "scalar": "scalar",
 }
 _METAL_MODE_RAW = os.environ.get("MLX_KDA_ENABLE_METAL_RECURRENCE", "0").strip().lower()
@@ -262,32 +261,7 @@ if _ENABLE_METAL_RECURRENCE:
     from ._metal_recurrence import HAS_METAL_KERNEL as _HAS_METAL_KERNEL  # noqa: E402
 
     if _HAS_METAL_KERNEL:
-        if _METAL_MODE == "per_chunk":
-            # Phase 2: replace the body with the fused per-chunk kernel.
-            from ._metal_recurrence import (  # noqa: E402
-                metal_recurrence_body_single as _metal_body,
-            )
-
-            def _recurrence_body_single(  # noqa: F811
-                state_slice, k_decayed, q_decayed, k_restored,
-                Mqk, INV_bf, vc, beta_bf16, g_total_exp,
-            ):
-                # Metal kernel is hardcoded to CHUNK=16 via simdgroup tile
-                # assignment (32 simdgroups per TG = 32 output tiles at
-                # CHUNK=16, D=128). Other chunk sizes fall through to
-                # mx.compile. D=128 is already fixed globally (reference.py
-                # D_FIXED), so only CHUNK needs the guard.
-                CHUNK = k_decayed.shape[1]
-                if CHUNK == 16:
-                    return _metal_body(
-                        state_slice, k_decayed, q_decayed, k_restored,
-                        Mqk, INV_bf, vc, beta_bf16, g_total_exp,
-                    )
-                return _mx_compiled_body_single(
-                    state_slice, k_decayed, q_decayed, k_restored,
-                    Mqk, INV_bf, vc, beta_bf16, g_total_exp,
-                )
-        elif _METAL_MODE == "scalar":
+        if _METAL_MODE == "scalar":
             # Phase 3a: the chunk loop itself lives inside the Metal kernel.
             # ``_recurrence_body_single`` stays at its mx.compile definition
             # (used only as a fallback for CHUNK≠16); the cross-chunk entry
@@ -350,47 +324,42 @@ def _metal_cross_chunk_flat_ragged_active() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Metal prepare kernel (PR H Branch A + follow-on 1) — env-gated, default OFF.
+# Metal prepare kernel — env-gated, default OFF.
 # ---------------------------------------------------------------------------
-# MLX_KDA_ENABLE_METAL_PREPARE values:
-#   "0" | "" | "off"          : disabled (baseline)
-#   "1" | "on" | "basic"      : basic prepare kernel — sections (b)-(g);
-#                               caller runs section (a) in MLX
-#   "fused" | "2"             : partial-fusion prepare kernel — q/k L2-norm
-#                               from section (a), plus sections (b)-(g), in
-#                               one Metal dispatch. Gate activation remains
-#                               in MLX to preserve varlen padding semantics.
-#   "fused2" | "3" | "full"   : full-fusion prepare kernel — section (a)
-#                               (q/k L2-norm AND KDA gate activation) plus
-#                               sections (b)-(g) in one dispatch. Padded
-#                               varlen positions are masked via a
-#                               per-chunk valid-token count.
+# MLX_KDA_ENABLE_METAL_PREPARE values (production envelope after
+# 2026-04-30 cleanup; see plan.md §8.4 for the historical fused / fused2
+# layers that were retired once fused3/fused4 superseded them):
+#
+#   "0" | "" | "off"               : disabled (baseline)
+#   "1" | "on" | "basic"           : basic prepare kernel — sections
+#                                    (b)-(g); caller runs section (a) in
+#                                    MLX. Strict 1e-5 tolerance band —
+#                                    the unique strict-band Metal-prepare
+#                                    bisect anchor.
+#   "fused3" | "4" | "token_major" : full-fusion prepare kernel reading
+#                                    token-major [T_total, H, D] inputs
+#                                    directly. 1-bf16-ULP fused2-band
+#                                    drift carried through to consumers.
+#   "fused4" | "5" | "flat_ragged" : flat-ragged metadata-indirected
+#                                    full-fusion prepare. PROD DEFAULT.
+#                                    Single-seq (N=1) callers route to
+#                                    fused3 internally; multi-seq packed
+#                                    varlen callers use the flat-ragged
+#                                    indirection.
 #
 # Each Metal mode introduces a 1-bf16-ULP shift on cumsum-/matmul-derived
 # outputs due to reduction-order differences between Metal sequential
 # cumsum / simdgroup_matrix and MLX's parallel scan / mx.matmul. That
 # shift propagates through the per-chunk recurrence and breaks
 # ``test_optimized_parity``'s 1e-5 gate, hence the default-off opt-in.
-# ``fused`` additionally adds a ~1-bf16-ULP shift on k_decayed/q_decayed
-# from the in-kernel L2-norm; ``fused2`` adds a similar shift on
-# g-derived outputs from the in-kernel sigmoid evaluation.
+# ``fused3``/``fused4`` additionally add a ~1-bf16-ULP shift on
+# k_decayed/q_decayed (in-kernel L2-norm) and g-derived outputs
+# (in-kernel sigmoid).
 
 _METAL_PREPARE_MODE_ALIASES = {
     "0": "off", "": "off", "off": "off", "false": "off",
     "1": "basic", "on": "basic", "basic": "basic",
-    "fused": "fused", "2": "fused",
-    "fused2": "fused2", "3": "fused2", "full": "fused2",
-    # PR K-a: token-major full-fusion. Same arithmetic as fused2; reads
-    # input q/k/v/g/beta directly from caller-supplied [T_total, H, D]
-    # buffers, eliminating the [n_chunks, CHUNK, H, D] -> tile-major
-    # transpose+contiguous-copy that fused2 forces on every forward.
     "fused3": "fused3", "4": "fused3", "token_major": "fused3",
-    # PR M Option A: flat-ragged token-major. Same arithmetic as fused3;
-    # reads chunks at arbitrary token offsets via a tiny int32 metadata
-    # table, eliminating the per-seq [N, max_padded_T, H, D] zero-pad
-    # allocation that the packed fused3 path forces (~30-50 MB at bench
-    # scale). Activates a single-kernel prepare across all packed
-    # sequences, then per-seq recurrence on flat-buffer slices.
     "fused4": "fused4", "5": "fused4", "flat_ragged": "fused4",
 }
 _METAL_PREPARE_MODE_RAW = os.environ.get("MLX_KDA_ENABLE_METAL_PREPARE", "0").strip().lower()
@@ -403,8 +372,6 @@ _METAL_PREPARE_MODE = _METAL_PREPARE_MODE_ALIASES[_METAL_PREPARE_MODE_RAW]
 _ENABLE_METAL_PREPARE = _METAL_PREPARE_MODE != "off"
 
 _metal_prepare_fn = None             # basic variant — (b)-(g) only
-_metal_prepare_fused_fn = None       # partial fusion — q/k L2 + (b)-(g)
-_metal_prepare_fused_v2_fn = None    # full fusion (tile-major) — section (a) + (b)-(g)
 _metal_prepare_fused_v3_fn = None    # full fusion (token-major) — PR K-a
 _metal_prepare_fused_v4_fn = None    # flat-ragged token-major — PR M Option A
 
@@ -414,14 +381,6 @@ if _ENABLE_METAL_PREPARE:
             HAS_METAL_KERNEL as _HAS_METAL_PREPARE,
             metal_prepare_chunk as _metal_prepare_fn,
         )
-        if _METAL_PREPARE_MODE in ("fused", "fused2", "fused3", "fused4"):
-            from ._metal_prepare import (  # noqa: E402
-                metal_prepare_chunk_fused as _metal_prepare_fused_fn,
-            )
-        if _METAL_PREPARE_MODE == "fused2":
-            from ._metal_prepare import (  # noqa: E402
-                metal_prepare_chunk_fused_v2 as _metal_prepare_fused_v2_fn,
-            )
         if _METAL_PREPARE_MODE == "fused3":
             from ._metal_prepare import (  # noqa: E402
                 metal_prepare_chunk_fused_v3 as _metal_prepare_fused_v3_fn,
@@ -439,8 +398,6 @@ if _ENABLE_METAL_PREPARE:
     except ImportError:
         _HAS_METAL_PREPARE = False
         _metal_prepare_fn = None
-        _metal_prepare_fused_fn = None
-        _metal_prepare_fused_v2_fn = None
         _metal_prepare_fused_v3_fn = None
         _metal_prepare_fused_v4_fn = None
 else:
@@ -448,37 +405,26 @@ else:
 
 
 def _metal_prepare_active() -> bool:
-    """True when the (basic) Metal prepare kernel should be used.
+    """True when the basic Metal prepare kernel should be used.
 
-    Covers ``basic``, ``fused``, and ``fused2`` modes because
-    ``_precompute_chunk_tensors`` handles the dispatch decision for all
-    three; only the input shapes flowing in differ.
+    Strict 1e-5 tolerance band — the unique strict-band Metal-prepare
+    bisect anchor. Higher-numbered fused modes (fused3 / fused4) carry
+    the documented 1-bf16-ULP fused2-band drift.
     """
     return _HAS_METAL_PREPARE and _metal_prepare_fn is not None
 
 
 def _metal_prepare_fused_active() -> bool:
-    """True when ANY fused prepare mode is active (fused / fused2 / fused3 / fused4).
+    """True when any fused prepare mode (fused3 / fused4) is active.
 
     Used by ``fwd_optimized`` for the entry-side bf16 preservation +
-    L2-norm skip path: all four fused kernels read q/k as raw values
-    and either L2-norm internally (fused/fused2/fused3/fused4) or skip
-    the pre-pass entirely. Each only loads the import that matches its
-    selected mode, but all four set ``_metal_prepare_fused_fn`` so this
-    flag covers them uniformly.
+    L2-norm skip path: both fused kernels read q/k as raw values and
+    L2-norm internally.
     """
-    return _HAS_METAL_PREPARE and _metal_prepare_fused_fn is not None
-
-
-def _metal_prepare_fused_v2_active() -> bool:
-    """True when the full-fusion (v2) Metal prepare kernel is selected.
-
-    When True, ``fwd_optimized`` skips both the MLX-side L2-norm of Q/K
-    and the KDA gate activation; the v2 kernel performs activation
-    in-place using a per-chunk valid-token count to mask padded
-    positions, preserving the activate-then-zero-pad varlen semantics.
-    """
-    return _HAS_METAL_PREPARE and _metal_prepare_fused_v2_fn is not None
+    return _HAS_METAL_PREPARE and (
+        _metal_prepare_fused_v3_fn is not None
+        or _metal_prepare_fused_v4_fn is not None
+    )
 
 
 def _metal_prepare_fused_v3_active() -> bool:
@@ -612,7 +558,8 @@ def _precompute_chunk_tensors(
     D: int,
     chunk: int,
     scale_bf16_rt: mx.array,
-    # Fused2 (full-fusion) mode params; required iff fused2 is active:
+    # Full-fusion (fused3 / fused4) mode params; required iff a fused
+    # mode is active so the kernel can run section (a) inline:
     a_log_exp: "mx.array | None" = None,
     dt_bias: "mx.array | None" = None,
     lower_bound_log2e: "mx.array | None" = None,
@@ -625,13 +572,13 @@ def _precompute_chunk_tensors(
 
     Kernel dispatch (CHUNK=16 only; MLX graph fallback otherwise):
 
-    * ``MLX_KDA_ENABLE_METAL_PREPARE=fused`` (partial fusion): dispatch
-      the fused kernel. Expects ``q_seq`` / ``k_seq`` as RAW values
-      (pre-L2-norm, pre-bf16); the kernel applies L2-norm + bf16
-      inside. ``g_seq`` is pre-activated by the caller — gate
-      activation stays in MLX (see ``fwd_optimized`` for rationale).
-    * ``MLX_KDA_ENABLE_METAL_PREPARE=1`` (basic): dispatch the basic
-      kernel. ``q_seq`` / ``k_seq`` are already post-section-(a).
+    * ``MLX_KDA_ENABLE_METAL_PREPARE=fused4`` / ``fused3``: full-fusion
+      Metal kernel runs section (a) (q/k L2-norm + KDA gate activation)
+      AND sections (b)-(g) in one dispatch. Inputs are RAW (post fp32
+      cast or bf16 passthrough). See ``_metal_prepare`` for the
+      kernel sources.
+    * ``MLX_KDA_ENABLE_METAL_PREPARE=1`` (basic): sections (b)-(g)
+      only. ``q_seq`` / ``k_seq`` are already post-section-(a).
     * ``MLX_KDA_ENABLE_METAL_PREPARE=0`` (default): pure MLX graph path.
     """
     padded_T = g_seq.shape[0]
@@ -670,36 +617,8 @@ def _precompute_chunk_tensors(
     # beta: [padded_T, H] → [n_chunks, chunk, H] → [n_chunks, H, chunk]
     bc = beta_seq.reshape(n_chunks, chunk, H).transpose(0, 2, 1)
 
-    if _metal_prepare_fused_v2_active():
-        # Full fusion: raw q/k AND raw g (kernel does L2-norm + bf16
-        # AND gate activation). Per-chunk valid-token count masks
-        # padded varlen positions inside the kernel.
-        assert a_log_exp is not None and dt_bias is not None, (
-            "fused2 mode requires a_log_exp and dt_bias"
-        )
-        assert lower_bound_log2e is not None and seq_len is not None, (
-            "fused2 mode requires lower_bound_log2e and seq_len"
-        )
-        valid_list = _valid_tokens_per_chunk_single(seq_len, n_chunks, chunk)
-        valid_arr = mx.array(valid_list, dtype=mx.int32)
-        return _metal_prepare_fused_v2_fn(
-            k_raw=kc, q_raw=qc, v=vc, g_raw=gc, beta=bc,
-            scale_bf16_rt=scale_bf16_rt,
-            a_log_exp=a_log_exp, dt_bias=dt_bias,
-            lower_bound_log2e=lower_bound_log2e,
-            valid_tokens_per_chunk=valid_arr,
-        )
-
-    if _metal_prepare_fused_active():
-        # Partial fusion: raw q/k (kernel does L2-norm + bf16),
-        # pre-activated g (caller ran section (a) gate activation in MLX).
-        return _metal_prepare_fused_fn(
-            k_raw=kc, q_raw=qc, v=vc, g_activated=gc, beta=bc,
-            scale_bf16_rt=scale_bf16_rt,
-        )
-
     if _metal_prepare_active():
-        # Fused Metal kernel: one dispatch per (chunk, head) tile, output
+        # Basic Metal kernel: one dispatch per (chunk, head) tile, output
         # dict has the same schema as ``_precompute_core``.
         # scale_bf16_rt is a 0-D scalar; the kernel wrapper accepts it as
         # either [1] or () shape and reshapes internally.
@@ -819,35 +738,6 @@ def _precompute_chunk_tensors_packed(
             "beta_bf16":   pre_flat["beta_bf16"]  .reshape(N, n_chunks, H, chunk, 1),
             "g_total_exp": pre_flat["g_total_exp"].reshape(N, n_chunks, H, D, 1),
         }
-
-    if _metal_prepare_fused_v2_active():
-        assert a_log_exp is not None and dt_bias is not None, (
-            "fused2 mode requires a_log_exp and dt_bias"
-        )
-        assert lower_bound_log2e is not None and seq_lens is not None, (
-            "fused2 mode requires lower_bound_log2e and seq_lens"
-        )
-        gc_flat, qc_flat, kc_flat, vc_flat, bc_flat = _flatten_for_kernel()
-        valid_list = _valid_tokens_per_chunk_packed(seq_lens, n_chunks, chunk)
-        valid_arr = mx.array(valid_list, dtype=mx.int32)
-        pre_flat = _metal_prepare_fused_v2_fn(
-            k_raw=kc_flat, q_raw=qc_flat, v=vc_flat,
-            g_raw=gc_flat, beta=bc_flat,
-            scale_bf16_rt=scale_bf16_rt,
-            a_log_exp=a_log_exp, dt_bias=dt_bias,
-            lower_bound_log2e=lower_bound_log2e,
-            valid_tokens_per_chunk=valid_arr,
-        )
-        return _reshape_back(pre_flat)
-
-    if _metal_prepare_fused_active():
-        gc_flat, qc_flat, kc_flat, vc_flat, bc_flat = _flatten_for_kernel()
-        pre_flat = _metal_prepare_fused_fn(
-            k_raw=kc_flat, q_raw=qc_flat, v=vc_flat,
-            g_activated=gc_flat, beta=bc_flat,
-            scale_bf16_rt=scale_bf16_rt,
-        )
-        return _reshape_back(pre_flat)
 
     if _metal_prepare_active():
         gc_flat, qc_flat, kc_flat, vc_flat, bc_flat = _flatten_for_kernel()
@@ -1224,32 +1114,30 @@ def fwd_optimized(
         state_fp32 = True
 
     # Section (a): L2-norm Q/K + KDA gate activation.
-    # Four Metal prepare modes affect what runs here vs. inside the kernel:
+    # Three Metal prepare modes affect what runs here vs. inside the
+    # kernel (see plan.md §8.4 for the historical fused/fused2 layers
+    # that fused3/fused4 superseded):
     #   * basic    : section (a) runs entirely in MLX.
-    #   * fused    : kernel does L2-norm; MLX still runs gate activation.
-    #   * fused2   : kernel does both (tile-major inputs). MLX only
-    #                precomputes the small per-head broadcast tensors
-    #                (a_log_exp, dt_bias_h, lower_bound_log2e) and threads
-    #                them through to the kernel, which masks padded varlen
-    #                positions inside.
-    #   * fused3   : same as fused2 but token-major inputs (PR K-a).
-    #                Also needs the per-head broadcasts.
+    #   * fused3   : kernel does both (token-major inputs, PR K-a).
+    #                MLX only precomputes the small per-head broadcast
+    #                tensors (a_log_exp, dt_bias_h, lower_bound_log2e)
+    #                and threads them through to the kernel, which
+    #                masks padded varlen positions inside.
     #   * fused4   : same as fused3 but flat-ragged token-major (PR M
     #                Option A). The N==1 single-seq path internally
     #                routes to v3; the N>1 packed path routes to v4
     #                with chunk_token_start metadata.
     _fused_active = _metal_prepare_fused_active()
-    _fused_v2_active = _metal_prepare_fused_v2_active()
     _fused_v3_active = _metal_prepare_fused_v3_active()
     _fused_v4_active = _metal_prepare_fused_v4_active()
 
     if not _fused_active:
-        # fused2/fused3/fused4 also want kernel-side L2-norm, hence the broader
-        # skip via _fused_active (which is True for any fused mode).
+        # fused3/fused4 want kernel-side L2-norm; basic and off-path
+        # need the MLX-side L2-norm.
         q = _q_bf16(_l2_normalize(q))
         k = _q_bf16(_l2_normalize(k))
 
-    if _fused_v2_active or _fused_v3_active or _fused_v4_active:
+    if _fused_v3_active or _fused_v4_active:
         # Precompute the per-head and scalar broadcasts once; the kernel
         # consumes these directly. ``g`` stays raw (post fp32 cast).
         a_log_exp_h = _ex2_ftz(A_log.astype(mx.float32) * LOG2E)        # [H]

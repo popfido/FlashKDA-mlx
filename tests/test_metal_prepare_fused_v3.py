@@ -1,21 +1,20 @@
 """Parity tests for the token-major full-fusion Metal prepare kernel
 (PR K-a, ``fused3``).
 
-The v3 kernel is functionally equivalent to ``fused_v2`` (full-fusion:
-L2-norm + KDA gate activation + sections (b)-(g) in one Metal dispatch).
-It differs only in the input layout: q/k/v/g arrive as token-major
-``[T_total, H, D]`` and beta as ``[T_total, H]``, eliminating the
+The v3 kernel runs full fusion (Q/K L2-norm + KDA gate activation +
+sections (b)-(g)) in one Metal dispatch, reading token-major
+``[T_total, H, D]`` inputs directly to skip the
 ``[n_chunks, CHUNK, H, D] -> [n_chunks, H, CHUNK, D]`` transpose +
-``ensure_row_contiguous`` copy that fused2 forces on every forward.
+``ensure_row_contiguous`` copy.
 
-Output buffers are tile-major ``[n_chunks, H, CHUNK, ...]`` (same as v2),
-so the recurrence kernel is unaffected.
+Output buffers are tile-major ``[n_chunks, H, CHUNK, ...]`` so the
+recurrence kernel is unaffected.
 
-Oracle: ``metal_prepare_chunk_fused_v2`` itself, which already passes
-parity vs. the full Python pipeline at ``rtol=5e-3 atol=2e-3``. We
-compare v3 to v2 byte-for-byte (tighter atol/rtol where applicable)
-since the only difference is input addressing — same arithmetic, same
-reduction order.
+Oracle: the full MLX-side pipeline (``_full_pipeline_oracle`` below).
+Tolerance matches the documented fused2-band 1-bf16-ULP drift —
+kernel-side sequential cumsum + simdgroup_matrix accumulators differ
+from MLX's parallel scan + ``mx.matmul`` by ~1 bf16 ULP on
+cumsum-/matmul-derived outputs.
 
 Skipped on M1/M2.
 """
@@ -34,7 +33,6 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from flash_kda_mlx._metal_prepare import (  # noqa: E402
     HAS_METAL_KERNEL,
-    metal_prepare_chunk_fused_v2,
     metal_prepare_chunk_fused_v3,
 )
 from flash_kda_mlx.optimized import (  # noqa: E402
@@ -102,7 +100,7 @@ def _make_inputs(n_chunks: int, H: int, seed: int) -> dict:
 
 
 def _to_v2_inputs(d: dict) -> dict:
-    """Apply the tile-major reshape that ``fused_v2`` requires."""
+    """Apply the tile-major reshape that the MLX-side oracle uses."""
     n_chunks = d["n_chunks"]
     H = d["H"]
 
@@ -158,18 +156,6 @@ def _run_v3(d: dict, valid_arr: mx.array) -> dict:
     )
 
 
-def _run_v2(d: dict, valid_arr: mx.array) -> dict:
-    v2 = _to_v2_inputs(d)
-    return metal_prepare_chunk_fused_v2(
-        k_raw=v2["k_raw"], q_raw=v2["q_raw"], v=v2["v"],
-        g_raw=v2["g_raw"], beta=v2["beta"],
-        scale_bf16_rt=d["scale_bf16_rt"],
-        a_log_exp=d["a_log_exp"], dt_bias=d["dt_bias"],
-        lower_bound_log2e=d["lower_bound_log2e"],
-        valid_tokens_per_chunk=valid_arr,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Structural checks
 # ---------------------------------------------------------------------------
@@ -212,60 +198,8 @@ def test_fused_v3_vc_dtype_bf16():
 
 
 # ---------------------------------------------------------------------------
-# Parity vs. fused_v2 (the only thing that differs is input addressing).
-# ---------------------------------------------------------------------------
-#
-# v3 reproduces v2 reductions byte-for-byte (same g_in / k_in / q_in
-# values reach the same threadgroup elements via different addressing).
-# We require atol=0 — anything else is a bug in the index math.
-
-@requires_metal
-@pytest.mark.parametrize("n_chunks, H, seed", [
-    (1, 1, 0),
-    (4, 2, 1),
-    (8, 4, 2),
-    (16, 8, 3),  # bench-shape-ish: T=256, H=8
-])
-def test_fused_v3_matches_fused_v2_all_valid(n_chunks, H, seed):
-    d = _make_inputs(n_chunks, H, seed)
-    valid_arr = mx.array([CHUNK] * n_chunks, dtype=mx.int32)
-    got = _run_v3(d, valid_arr)
-    ref = _run_v2(d, valid_arr)
-    for name in ("k_decayed", "q_decayed", "k_restored",
-                 "Mqk", "INV_bf", "beta_bf16", "g_total_exp", "vc"):
-        np.testing.assert_array_equal(
-            np.asarray(got[name]),
-            np.asarray(ref[name]),
-            err_msg=f"{name}: n_chunks={n_chunks} H={H} seed={seed}",
-        )
-
-
-@requires_metal
-@pytest.mark.parametrize("seq_len, H, seed", [
-    (13, 2, 11),    # 1 partial chunk
-    (37, 4, 12),    # 3 chunks, last has 5 valid tokens
-    (96, 4, 13),    # exact multiple of CHUNK (no partial)
-    (130, 4, 14),   # 9 chunks, last has 2 valid tokens
-])
-def test_fused_v3_matches_fused_v2_partial_last_chunk(seq_len, H, seed):
-    n_chunks = (seq_len + CHUNK - 1) // CHUNK
-    d = _make_inputs(n_chunks, H, seed)
-    valid_list = _valid_tokens_per_chunk_single(seq_len, n_chunks, CHUNK)
-    valid_arr = mx.array(valid_list, dtype=mx.int32)
-    got = _run_v3(d, valid_arr)
-    ref = _run_v2(d, valid_arr)
-    for name in ("k_decayed", "q_decayed", "k_restored",
-                 "Mqk", "INV_bf", "beta_bf16", "g_total_exp", "vc"):
-        np.testing.assert_array_equal(
-            np.asarray(got[name]),
-            np.asarray(ref[name]),
-            err_msg=f"{name}: seq_len={seq_len} H={H} seed={seed}",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Parity vs. full Python pipeline. This is the ground-truth gate; tolerance
-# matches the v2 band (kernel-side reductions differ from MLX by ~1 bf16 ULP).
+# Parity vs. full Python pipeline. This is the ground-truth gate;
+# tolerance matches the documented fused2-band 1-bf16-ULP drift.
 # ---------------------------------------------------------------------------
 
 _FUSED3_ATOL = 2e-3

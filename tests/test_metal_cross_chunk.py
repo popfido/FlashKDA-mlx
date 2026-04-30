@@ -26,7 +26,6 @@ Skipped on M1/M2 per plan §8.
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 import mlx.core as mx
@@ -303,66 +302,3 @@ def test_cross_chunk_rejects_wrong_chunk(fn):
         )
 
 
-# ---------------------------------------------------------------------------
-# Bench gate — not catastrophically slower than Phase 2 per-chunk kernel
-# ---------------------------------------------------------------------------
-#
-# We don't require cross-chunk to *beat* per-chunk at these small shapes —
-# the architectural win scales with n_chunks and the per-chunk path has a
-# very efficient mx.compile wrapping for tiny dispatches. We just require
-# cross-chunk to stay within ±30% of per-chunk wall-clock so a kernel
-# regression (e.g., wrong TG size, uncoalesced access, bank conflicts) gets
-# caught before it ships.
-
-@requires_metal
-@pytest.mark.parametrize("fn", ROUTINGS)
-def test_cross_chunk_bench_not_catastrophic(fn):
-    H, n_chunks = 4, 32
-    data = _make_inputs(n_chunks, H, seed=42)
-
-    from flash_kda_mlx._metal_recurrence import metal_recurrence_body_single
-
-    # Warmup both kernels.
-    for _ in range(3):
-        ref_out, ref_state = _mx_loop_reference(**data)
-        got_out, got_state = _call(fn, data)
-        mx.eval(ref_out, ref_state, got_out, got_state)
-
-    N = 20
-
-    # Baseline: the Phase 2 per-chunk Metal kernel in a Python loop.
-    t0 = time.perf_counter()
-    for _ in range(N):
-        state = data["state_in"]
-        outs = []
-        for c in range(n_chunks):
-            out_h, state = metal_recurrence_body_single(
-                state,
-                data["k_decayed"][c],
-                data["q_decayed"][c],
-                data["k_restored"][c],
-                data["Mqk"][c],
-                data["INV_bf"][c],
-                data["vc"][c],
-                data["beta_bf16"][c],
-                data["g_total_exp"][c],
-            )
-            outs.append(out_h)
-        stack = mx.stack(outs, axis=0)
-        mx.eval(stack, state)
-    t_phase2 = time.perf_counter() - t0
-
-    # Phase 3: single kernel call, chunks live inside.
-    t0 = time.perf_counter()
-    for _ in range(N):
-        got_out, got_state = _call(fn, data)
-        mx.eval(got_out, got_state)
-    t_phase3 = time.perf_counter() - t0
-
-    ratio = t_phase3 / t_phase2
-    # Allow generous margin; this test guards against regressions of
-    # >4x, not performance tuning.
-    assert ratio < 4.0, (
-        f"Phase 3 cross-chunk {t_phase3*1000:.1f} ms vs Phase 2 "
-        f"{t_phase2*1000:.1f} ms — ratio {ratio:.2f}x exceeds 4x bar"
-    )

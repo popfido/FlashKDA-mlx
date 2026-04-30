@@ -36,17 +36,17 @@
 
 | Case | `flash_kda_mlx` mean (ms) | `mlx_chunk_kda` mean (ms) | Speedup vs `chunk_kda` | `mlx_chunk_gdn` mean (ms) | Speedup vs `gdn` |
 |------|--------------------:|--------------------------:|-----------------------:|--------------------------:|-----------------:|
-| Fixed | 49.8054 | 242.2472 | 4.86× | 139.5306 | 2.80× |
-| Varlen, `seq_lens`=[1300, 547, 2048, 963, 271, 3063] | 52.5205 | 147.6060 | 2.81× | 88.0175 | 1.68× |
-| Varlen, `seq_lens`=`1024 x 8` | 44.7257 | 107.6768 | 2.41× | 75.5580 | 1.69× |
+| Fixed | 50.1681 | 236.0081 | 4.70× | 143.1475 | 2.85× |
+| Varlen, `seq_lens`=[1300, 547, 2048, 963, 271, 3063] | 53.6859 | 151.9882 | 2.83× | 90.3737 | 1.68× |
+| Varlen, `seq_lens`=`1024 x 8` | 48.4627 | 120.8043 | 2.49× | 81.9941 | 1.69× |
 
 ### `T=8192`, `H=64`, `D=128`
 
 | Case | `flash_kda_mlx` mean (ms) | `mlx_chunk_kda` mean (ms) | Speedup vs `chunk_kda` | `mlx_chunk_gdn` mean (ms) | Speedup vs `gdn` |
 |------|--------------------:|--------------------------:|-----------------------:|--------------------------:|-----------------:|
-| Fixed | 31.5335 | 136.2084 | 4.32× | 72.1679 | 2.29× |
-| Varlen, `seq_lens`=[1300, 547, 2048, 963, 271, 3063] | 34.0876 | 83.1070 | 2.44× | 56.8234 | 1.67× |
-| Varlen, `seq_lens`=`1024 x 8` | 31.1406 | 68.4038 | 2.20× | 52.6970 | 1.69× |
+| Fixed | 33.1898 | 161.7326 | 4.87× | 86.1329 | 2.60× |
+| Varlen, `seq_lens`=[1300, 547, 2048, 963, 271, 3063] | 37.9614 | 93.2260 | 2.46× | 60.5478 | 1.59× |
+| Varlen, `seq_lens`=`1024 x 8` | 32.9236 | 76.4589 | 2.32× | 55.5138 | 1.69× |
 
 
 > **Run-to-run variance.** Headline columns report the mean across `iters=10` (after `warmup=3`). Empirical run-to-run spread on this hardware is **≤2 ms** on every bench-scale row (±5% E2E typical). Speedup ratios within 5% of 1.00× should be treated as noise. Use `--iters 20` for tighter A/B comparisons.
