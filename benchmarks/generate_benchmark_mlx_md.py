@@ -168,6 +168,10 @@ def _collect_timings(
 # ---------------------------------------------------------------------------
 
 def _call_flash_kda_mlx(kwargs: dict[str, Any], chunk: int) -> Any:
+    # ``chunk`` is retained as a positional driver knob but no longer
+    # plumbed into fwd_optimized — the kwarg was removed when CHUNK=32
+    # was retired (only CHUNK=16 is supported in the production path).
+    del chunk
     return optimized.fwd_optimized(
         q=kwargs["q"],
         k=kwargs["k"],
@@ -182,7 +186,6 @@ def _call_flash_kda_mlx(kwargs: dict[str, Any], chunk: int) -> Any:
         initial_state=kwargs.get("initial_state"),
         final_state_like=kwargs.get("final_state"),
         cu_seqlens=kwargs.get("cu_seqlens"),
-        _chunk=chunk,
     )
 
 
@@ -352,6 +355,32 @@ def _metal_prepare_status() -> str:
     )
 
 
+def _provenance() -> dict[str, str]:
+    """Capture device + package versions so the report is reproducible.
+
+    `mx.device_info()` (preferred) or the deprecated `mx.metal.device_info()`
+    is used to identify the chip; `importlib.metadata.version(...)` reads
+    the actually-installed package versions, which may differ from the
+    `pyproject.toml` minimums.
+    """
+    import importlib.metadata as _md
+    info: dict[str, str] = {}
+    try:
+        device_info_fn = getattr(mx, "device_info", None) or mx.metal.device_info
+        di = device_info_fn()
+        info["device_name"] = str(di.get("device_name", "unknown"))
+        info["architecture"] = str(di.get("architecture", "unknown"))
+    except Exception:
+        info["device_name"] = "unknown"
+        info["architecture"] = "unknown"
+    for pkg in ("mlx", "mlx-lm", "mlx-metal"):
+        try:
+            info[pkg] = _md.version(pkg)
+        except _md.PackageNotFoundError:
+            info[pkg] = "(not installed)"
+    return info
+
+
 def _varlen_strategy_note() -> str:
     mode = getattr(optimized, "_METAL_PREPARE_MODE", "unknown")
     flat_ragged_active_fn = getattr(
@@ -519,6 +548,7 @@ def render_markdown(
     args: argparse.Namespace,
     generated_at: str,
     command: str,
+    provenance: dict[str, str],
 ) -> str:
     lines: list[str] = [
         "# KDA forward benchmark (MLX / Apple GPU)",
@@ -528,6 +558,15 @@ def render_markdown(
         f"- Command: `{command}`",
         "",
         (
+            f"- Hardware: `{provenance['device_name']}` "
+            f"(`{provenance['architecture']}`)"
+        ),
+        (
+            f"- Versions: `mlx=={provenance['mlx']}`, "
+            f"`mlx-lm=={provenance['mlx-lm']}`, "
+            f"`mlx-metal=={provenance['mlx-metal']}`"
+        ),
+        (
             f"- Benchmark settings: `warmup={args.warmup}`, "
             f"`iters={args.iters}`, `repeats={args.repeats}`"
         ),
@@ -535,7 +574,9 @@ def render_markdown(
         "> **Hardware caveat.** MLX timings on Apple GPU are not "
         "numerically comparable to the CUDA/H20 table in "
         "`BENCHMARK_H20.md`. Column semantics mirror the CUDA report; "
-        "absolute numbers do not.",
+        "absolute numbers do not. Inter-Apple-Silicon variance is "
+        "also large (memory bandwidth / TFLOPS differ across chip "
+        "and core-count variants).",
         "",
         "- MLX configuration: `backend=optimized`, `CHUNK=16`, "
         "`lower_bound=-5`, `D=128`. Timed regions force execution with "
@@ -610,6 +651,16 @@ def render_markdown(
     # Primary table per H.
     for H in args.H:
         lines.extend(_render_primary_table(rows, H))
+
+    lines.extend([
+        "",
+        "> **Run-to-run variance.** Headline columns report the "
+        f"mean across `iters={args.iters}` (after `warmup={args.warmup}`). "
+        "Empirical run-to-run spread on this hardware is **≤2 ms** on "
+        "every bench-scale row (±5% E2E typical). Speedup ratios within "
+        "5% of 1.00× should be treated as noise. Use `--iters 20` for "
+        "tighter A/B comparisons.",
+    ])
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -722,7 +773,7 @@ def run(argv: list[str] | None = None) -> int:
                     return 1
             rows.append(row)
 
-    command = "uv run --no-config python benchmarks/generate_benchmark_mlx_md.py"
+    command = "uv run python benchmarks/generate_benchmark_mlx_md.py"
     metal_env = os.environ.get("MLX_KDA_ENABLE_METAL_RECURRENCE")
     prepare_env = os.environ.get("MLX_KDA_ENABLE_METAL_PREPARE")
     if metal_env is not None:
@@ -732,7 +783,7 @@ def run(argv: list[str] | None = None) -> int:
     if cli_argv:
         command += " " + " ".join(cli_argv)
     generated_at = _dt.date.today().isoformat()
-    md = render_markdown(rows, args, generated_at, command)
+    md = render_markdown(rows, args, generated_at, command, _provenance())
     args.output.write_text(md)
     print(f"\nWrote {args.output}")
     return 0

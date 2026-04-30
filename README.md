@@ -7,6 +7,29 @@ This repository is intentionally independent from the original CUDA/CUTLASS
 FlashKDA source tree. It contains only the MLX package, MLX benchmark scripts,
 torch-reference parity fixtures, and MLX-side documentation.
 
+## Headline numbers (Apple M3 Max, MLX 0.31.2)
+
+`flash_kda_mlx` beats both MLX-LM-backed baselines on every bench-scale
+row at `T=8192`, `D=128`:
+
+| H | Case | `flash_kda_mlx` (ms) | vs `mlx_chunk_kda` | vs `mlx_chunk_gdn` |
+|---:|---|---:|:---:|:---:|
+| 96 | Fixed | 49.8 | **4.86×** | **2.80×** |
+| 96 | Varlen, mixed `[1300, 547, 2048, 963, 271, 3063]` | 52.5 | **2.81×** | **1.68×** |
+| 96 | Varlen, uniform `1024 × 8` | 44.7 | **2.41×** | **1.69×** |
+| 64 | Fixed | 31.5 | **4.32×** | **2.29×** |
+| 64 | Varlen, mixed | 34.1 | **2.44×** | **1.67×** |
+| 64 | Varlen, uniform | 31.1 | **2.20×** | **1.69×** |
+
+Cumulative speedup vs the no-Metal `mx.compile`-only baseline:
+**5.7–6.4×** at bench scale. See `BENCHMARK_MLX.md` for the full
+report (provenance, env flags, variance band) and `STATUS.md` for the
+shipped optimization track.
+
+> Apple GPU MLX timings are **not** numerically comparable to the CUDA/H20
+> table in `BENCHMARK_H20.md` — column semantics correspond, absolute
+> numbers do not.
+
 ## Contents
 
 - `flash_kda_mlx/`: public MLX operators, reference path, optimized path, and Metal kernels.
@@ -31,15 +54,15 @@ is not required.
 ## Test
 
 ```bash
-uv run --no-config pytest
+uv run pytest
 ```
 
 Useful focused subsets:
 
 ```bash
-uv run --no-config pytest tests/test_parity_fixtures.py
-uv run --no-config pytest tests/test_chunk_baseline_torch_reference.py
-uv run --no-config pytest tests/test_optimized_parity.py
+uv run pytest tests/test_parity_fixtures.py
+uv run pytest tests/test_chunk_baseline_torch_reference.py
+uv run pytest tests/test_optimized_parity.py
 ```
 
 ## Benchmark
@@ -49,7 +72,7 @@ Current production MLX benchmark flags:
 ```bash
 MLX_KDA_ENABLE_METAL_PREPARE=fused4 \
 MLX_KDA_ENABLE_METAL_RECURRENCE=1 \
-uv run --no-config python benchmarks/generate_benchmark_mlx_md.py \
+uv run python benchmarks/generate_benchmark_mlx_md.py \
   --output BENCHMARK_MLX.md
 ```
 
