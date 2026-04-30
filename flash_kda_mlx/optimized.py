@@ -159,54 +159,6 @@ if _METAL_MODE_RAW not in _METAL_MODE_ALIASES:
 _METAL_MODE = _METAL_MODE_ALIASES[_METAL_MODE_RAW]
 _ENABLE_METAL_RECURRENCE = _METAL_MODE != "off"
 
-# Chunk-size prototype (plan.md §"CHUNK = 32 or 64 prototype"). The reference
-# path keeps ``CHUNK = 16`` — it is the oracle. The optimized path accepts
-# ``MLX_KDA_CHUNK in {16, 32}`` to trade one chunk-axis halving for a wider
-# Neumann series (one extra factor) and wider per-chunk state-update window.
-# Default ``16`` preserves fixture parity; ``32`` is opt-in behind the env
-# var *and* a private ``_chunk`` kwarg that tests use to A/B without env
-# mutation. Values other than 16 or 32 raise ``ValueError``.
-_ALLOWED_CHUNKS = (16, 32)
-
-
-def _resolve_chunk(explicit: Optional[int]) -> int:
-    if explicit is not None:
-        chunk = int(explicit)
-    else:
-        chunk = int(os.environ.get("MLX_KDA_CHUNK", str(CHUNK)))
-    if chunk not in _ALLOWED_CHUNKS:
-        raise ValueError(
-            f"MLX_KDA_CHUNK / _chunk must be one of {_ALLOWED_CHUNKS}, got {chunk}"
-        )
-    return chunk
-
-
-def _ex2_pos_safe(x: mx.array) -> mx.array:
-    """``_ex2_ftz``-compatible exp for positive-large exponents.
-
-    The CHUNK=32 path runs ``ex_neg = 2**(-g_cumsum)`` where ``-g_cumsum``
-    reaches ~230 at ``lower_bound=-5`` — overflowing both fp32 (max exp 128)
-    and bf16 (max exp 127). The matching ``ex_pos = 2**g_cumsum`` is
-    simultaneously ftz-flushed to zero for those tokens, so the pair ends
-    up as ``0 * inf = NaN`` through the ``k_decayed @ k_inv.T`` matmul.
-
-    Clamping the *input* at 126 prevents the overflow. This is safe because
-    the bf16 quantization of ``k_decayed`` already zeros the late-token
-    rows it multiplies against (bf16 min normal ≈ 2^-126, values below
-    that underflow), so the affected L entries are 0 regardless of whether
-    ``ex_neg`` is the clamped or the true-but-infinite value. The clamp
-    only rescues us from the NaN propagation path.
-
-    At CHUNK=16 / ``lower_bound=-5``, max ``|-g_cumsum| ≈ 115 < 126``, so
-    this helper is a **no-op** at the supported oracle configuration — no
-    change to parity vs. the reference.
-    """
-    x_f = mx.minimum(x.astype(mx.float32), 126.0)
-    y = mx.power(mx.array(2.0, dtype=mx.float32), x_f)
-    tiny = 1.1754943508222875e-38  # float32 tiny
-    return mx.where(mx.abs(y) < tiny, mx.zeros_like(y), y)
-
-
 # ---------------------------------------------------------------------------
 # Recurrence step (one chunk)
 # ---------------------------------------------------------------------------
@@ -688,7 +640,7 @@ def _precompute_chunk_tensors(
 
     # PR K-a: fused3 reads token-major inputs directly. Skip the
     # tile-major transpose+contiguous-copy that fused/fused2 force.
-    if _metal_prepare_fused_v3_active() and chunk == 16:
+    if _metal_prepare_fused_v3_active():
         assert a_log_exp is not None and dt_bias is not None, (
             "fused3 mode requires a_log_exp and dt_bias"
         )
@@ -718,7 +670,7 @@ def _precompute_chunk_tensors(
     # beta: [padded_T, H] → [n_chunks, chunk, H] → [n_chunks, H, chunk]
     bc = beta_seq.reshape(n_chunks, chunk, H).transpose(0, 2, 1)
 
-    if _metal_prepare_fused_v2_active() and chunk == 16:
+    if _metal_prepare_fused_v2_active():
         # Full fusion: raw q/k AND raw g (kernel does L2-norm + bf16
         # AND gate activation). Per-chunk valid-token count masks
         # padded varlen positions inside the kernel.
@@ -738,7 +690,7 @@ def _precompute_chunk_tensors(
             valid_tokens_per_chunk=valid_arr,
         )
 
-    if _metal_prepare_fused_active() and chunk == 16:
+    if _metal_prepare_fused_active():
         # Partial fusion: raw q/k (kernel does L2-norm + bf16),
         # pre-activated g (caller ran section (a) gate activation in MLX).
         return _metal_prepare_fused_fn(
@@ -746,7 +698,7 @@ def _precompute_chunk_tensors(
             scale_bf16_rt=scale_bf16_rt,
         )
 
-    if _metal_prepare_active() and chunk == 16:
+    if _metal_prepare_active():
         # Fused Metal kernel: one dispatch per (chunk, head) tile, output
         # dict has the same schema as ``_precompute_core``.
         # scale_bf16_rt is a 0-D scalar; the kernel wrapper accepts it as
@@ -798,7 +750,7 @@ def _precompute_chunk_tensors_packed(
     # because the first two axes are already row-contiguous in the
     # caller's pack stack), then call the v3 kernel.  Output is tile-major
     # [N*n_chunks, H, CHUNK, ...]; we reshape back to [N, n_chunks, ...].
-    if _metal_prepare_fused_v3_active() and chunk == 16:
+    if _metal_prepare_fused_v3_active():
         assert a_log_exp is not None and dt_bias is not None, (
             "fused3 mode requires a_log_exp and dt_bias"
         )
@@ -868,7 +820,7 @@ def _precompute_chunk_tensors_packed(
             "g_total_exp": pre_flat["g_total_exp"].reshape(N, n_chunks, H, D, 1),
         }
 
-    if _metal_prepare_fused_v2_active() and chunk == 16:
+    if _metal_prepare_fused_v2_active():
         assert a_log_exp is not None and dt_bias is not None, (
             "fused2 mode requires a_log_exp and dt_bias"
         )
@@ -888,7 +840,7 @@ def _precompute_chunk_tensors_packed(
         )
         return _reshape_back(pre_flat)
 
-    if _metal_prepare_fused_active() and chunk == 16:
+    if _metal_prepare_fused_active():
         gc_flat, qc_flat, kc_flat, vc_flat, bc_flat = _flatten_for_kernel()
         pre_flat = _metal_prepare_fused_fn(
             k_raw=kc_flat, q_raw=qc_flat, v=vc_flat,
@@ -897,7 +849,7 @@ def _precompute_chunk_tensors_packed(
         )
         return _reshape_back(pre_flat)
 
-    if _metal_prepare_active() and chunk == 16:
+    if _metal_prepare_active():
         gc_flat, qc_flat, kc_flat, vc_flat, bc_flat = _flatten_for_kernel()
         pre_flat = _metal_prepare_fn(
             k=kc_flat, q=qc_flat, v=vc_flat, g=gc_flat, beta=bc_flat,
@@ -937,13 +889,7 @@ def _precompute_core(
     g_total = g_cumsum[..., -1:, :]                         # [..., H, 1, D]
 
     ex_pos = _q_bf16(_ex2_ftz(g_cumsum))
-    # ex_neg uses the overflow-safe variant. ex_pos and ex_gtot apply 2**x
-    # to values that are always <= 0 (g is negative, cumsum is monotone
-    # decreasing), so their only failure mode is ftz underflow, which
-    # ``_ex2_ftz`` already handles. Only ``-g_cumsum`` can be very positive
-    # and needs the cap. At CHUNK=16 this is a no-op; at CHUNK=32 it
-    # prevents the 0 * inf = NaN path (see ``_ex2_pos_safe`` docstring).
-    ex_neg = _q_bf16(_ex2_pos_safe(-g_cumsum))
+    ex_neg = _q_bf16(_ex2_ftz(-g_cumsum))
     ex_gtot = _q_bf16(_ex2_ftz(g_total))
 
     k_decayed = _q_bf16(kc * ex_pos)
@@ -981,11 +927,6 @@ def _precompute_core(
     INV = INV + _fp16_mm(INV, L4)
     L8 = _fp16_mm(L4, L4)
     INV = INV + _fp16_mm(INV, L8)
-    if chunk >= 32:
-        # Extra factor for CHUNK=32 nilpotent closure: L^32 = 0, so we need
-        # the product degree to reach 31 (= 1+2+4+8+16), hence ``(I + L^16)``.
-        L16 = _fp16_mm(L8, L8)
-        INV = INV + _fp16_mm(INV, L16)
 
     INV_bf = _q_bf16(INV)                                   # [..., H, chunk, chunk]
 
@@ -1040,9 +981,9 @@ def _run_single(
     ``*_seq`` tensors are padded to a multiple of ``chunk`` on axis 0.
     ``state_in`` is ``[H, D, D]`` fp32-valued.
 
-    When the Metal cross-chunk kernel (Phase 3) is active AND ``chunk == 16``,
-    the entire per-chunk Python loop collapses into ONE Metal dispatch with
-    state held in threadgroup memory across chunks.
+    When the Metal cross-chunk kernel (Phase 3) is active, the entire
+    per-chunk Python loop collapses into ONE Metal dispatch with state
+    held in threadgroup memory across chunks.
 
     The ``a_log_exp`` / ``dt_bias`` / ``lower_bound_log2e`` triple is only
     consumed by the fused2 (full-fusion) Metal prepare kernel; other
@@ -1059,7 +1000,7 @@ def _run_single(
     # -----------------------------------------------------------------
     # Phase 3 fast path: one Metal kernel per head, chunks inside shader.
     # -----------------------------------------------------------------
-    if _metal_cross_chunk_active() and chunk == 16:
+    if _metal_cross_chunk_active():
         seq_out, state_out = _metal_cross_chunk_fn(
             state_in,
             pre["k_decayed"], pre["q_decayed"], pre["k_restored"],
@@ -1153,7 +1094,7 @@ def _run_packed(
     # parallel via the grid z-axis. State freeze is handled inside the
     # shader by gating step 6 on c < n_chunks_per_seq[seq_id].
     # -----------------------------------------------------------------
-    if _metal_cross_chunk_packed_active() and chunk == 16:
+    if _metal_cross_chunk_packed_active():
         chunk_stack, state_out = _metal_cross_chunk_packed_fn(
             state_in,
             pre["k_decayed"], pre["q_decayed"], pre["k_restored"],
@@ -1233,40 +1174,26 @@ def fwd_optimized(
     initial_state: Optional[mx.array],
     final_state_like: Optional[mx.array],
     cu_seqlens: Optional[mx.array],
-    _chunk: Optional[int] = None,
 ) -> tuple[mx.array, Optional[mx.array]]:
     _validate(q, k, v, g, beta, out_like, A_log, dt_bias,
               initial_state, final_state_like, cu_seqlens)
 
-    chunk = _resolve_chunk(_chunk)
+    chunk = CHUNK
 
     B, T_seq, H, D = q.shape
     T_total = B * T_seq
 
-    # PR H follow-on 3 Phase B: under fused prepare modes at CHUNK=16, the
-    # Metal kernel reads bf16 inputs directly (Metal implicit bfloat→float
-    # on load) so the entry-side fp32 promotion is unnecessary — saving
-    # ~268 MB of bandwidth at bench scale (4 casts × 67 MB at H=64). PR
-    # CHUNK32-a extends the safe subset of this idea to the appendix-only
-    # CHUNK=32 path when a fused prepare mode is selected: q/k are cast by
-    # ``_l2_normalize``, g promotes through ``+ dt_bias(fp32)``, and v
-    # promotes inside the recurrence subtraction. beta is still explicitly
-    # promoted because ``mx.sigmoid(bf16)`` returns bf16, unlike the
-    # reference's entry-fp32 beta semantics.
-    _entry_skip_fp32 = _metal_prepare_fused_active() and chunk == 16
-    _entry_skip_fp32_partial = _metal_prepare_fused_active() and chunk == 32
+    # PR H follow-on 3 Phase B: under fused prepare modes the Metal kernel
+    # reads bf16 inputs directly (Metal implicit bfloat→float on load) so
+    # the entry-side fp32 promotion is unnecessary — saving ~268 MB of
+    # bandwidth at bench scale (4 casts × 67 MB at H=64).
+    _entry_skip_fp32 = _metal_prepare_fused_active()
     if _entry_skip_fp32:
         q = q.reshape(T_total, H, D)
         k = k.reshape(T_total, H, D)
         v = v.reshape(T_total, H, D)
         g = g.reshape(T_total, H, D)
         beta = beta.reshape(T_total, H)
-    elif _entry_skip_fp32_partial:
-        q = q.reshape(T_total, H, D)
-        k = k.reshape(T_total, H, D)
-        v = v.reshape(T_total, H, D)
-        g = g.reshape(T_total, H, D)
-        beta = beta.reshape(T_total, H).astype(mx.float32)
     else:
         q = q.reshape(T_total, H, D).astype(mx.float32)
         k = k.reshape(T_total, H, D).astype(mx.float32)
@@ -1311,10 +1238,10 @@ def fwd_optimized(
     #                Option A). The N==1 single-seq path internally
     #                routes to v3; the N>1 packed path routes to v4
     #                with chunk_token_start metadata.
-    _fused_active = _metal_prepare_fused_active() and chunk == 16
-    _fused_v2_active = _metal_prepare_fused_v2_active() and chunk == 16
-    _fused_v3_active = _metal_prepare_fused_v3_active() and chunk == 16
-    _fused_v4_active = _metal_prepare_fused_v4_active() and chunk == 16
+    _fused_active = _metal_prepare_fused_active()
+    _fused_v2_active = _metal_prepare_fused_v2_active()
+    _fused_v3_active = _metal_prepare_fused_v3_active()
+    _fused_v4_active = _metal_prepare_fused_v4_active()
 
     if not _fused_active:
         # fused2/fused3/fused4 also want kernel-side L2-norm, hence the broader
@@ -1383,7 +1310,7 @@ def fwd_optimized(
     # -------------------------------------------------------------------
     use_flat_ragged = (
         _metal_prepare_fused_v4_active()
-        and chunk == 16
+       
         and N > 1
         and not _DISABLE_PACKED
         and _metal_cross_chunk_active()

@@ -105,9 +105,6 @@ def test_heuristic_empty_seq_lens_returns_false():
         # function must not crash and must be consistent with its rule.
         ([8192], 64, 16, False,
          "fixed_T8192_H64 single-seq: max_c=512, H=64 → 32768 → per-seq"),
-        # CHUNK=32 halves max_c, so the threshold bites later.
-        ([1024] * 8, 32, 32, True,
-         "chunk=32 uniform_H32: max_c=32, H=32 → 1024 == threshold"),
     ],
 )
 def test_heuristic_routes_correctly(seq_lens, H, chunk, expected, label):

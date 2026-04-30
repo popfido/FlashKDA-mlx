@@ -138,10 +138,9 @@ inline float ex2_ftz(float x) {
     return (fabs(y) < 1.1754943508222875e-38f) ? 0.0f : y;
 }
 
-// _ex2_pos_safe: clamp input to 126.0 BEFORE exp2 to prevent fp32 overflow,
-// then ftz. Matches optimized._ex2_pos_safe semantics. At CHUNK=16 with
-// lower_bound=-5 this clamp is a no-op (|-g_cumsum| <= ~115), but kept
-// to mirror Python bit-for-bit.
+// ex2_pos_safe: clamp input to 126.0 BEFORE exp2 to prevent fp32 overflow,
+// then ftz. At the supported CHUNK=16 / lower_bound=-5 envelope the clamp
+// is a no-op (|-g_cumsum| <= ~115); kept as defensive headroom.
 inline float ex2_pos_safe(float x) {
     float clamped = fmin(x, 126.0f);
     float y = exp2(clamped);
