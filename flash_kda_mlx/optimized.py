@@ -1276,13 +1276,17 @@ def fwd_optimized(
 
     if cu_seqlens is not None:
         cu = cu_seqlens
+        # tolist() is one device→host sync; the prior loop did N+1
+        # serial cu[i].item() syncs that gated every prepare-kernel launch.
+        cu_list = cu.tolist()
     else:
+        # Synthesize segmentation in pure Python — avoids the host→device
+        # build + device→host readback round-trip for the trivial case.
         if B > 1:
-            cu = mx.arange(0, B * T_seq + 1, T_seq, dtype=mx.int64)
+            cu_list = list(range(0, B * T_seq + 1, T_seq))
         else:
-            cu = mx.array([0, T_total], dtype=mx.int64)
-    mx.eval(cu)
-    cu_list = [int(cu[i].item()) for i in range(cu.shape[0])]
+            cu_list = [0, T_total]
+        cu = mx.array(cu_list, dtype=mx.int64)
     N = len(cu_list) - 1
 
     want_final = final_state_like is not None
