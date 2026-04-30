@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+benchmarks/traces/
+benchmarks/results/
+
+# Planning, status, analysis, and Claude-specific docs (kept local)
+plan.md
+STATUS.md
+CLAUDE.md
+benchmarks/section_timings_report.md

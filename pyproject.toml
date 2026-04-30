@@ -1,0 +1,39 @@
+[project]
+name = "flash-kda-mlx"
+version = "0.1.0"
+description = "MLX / Metal implementation and benchmark harness for FlashKDA-style Kimi Delta Attention"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.18.0",
+    "mlx-lm>=0.20.0",
+    "numpy>=1.26",
+]
+
+[tool.setuptools.packages.find]
+include = ["flash_kda_mlx*"]
+exclude = ["tests*", "benchmarks*", "scripts*"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+default-groups = ["test"]
+
+[dependency-groups]
+test = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.5",
+    "torch>=2.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+markers = [
+    "slow: marks tests that run large benchmark-shape cases",
+]
