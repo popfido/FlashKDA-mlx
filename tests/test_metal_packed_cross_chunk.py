@@ -3,7 +3,8 @@
 Phase 4 extends the Phase 3b simdgroup cross-chunk kernel with an extra
 ``N`` (sequence) leading axis plus an ``active_mask`` (derived from
 ``n_chunks_per_seq``) to match the packed variant's state-freeze
-semantics documented in ``VARLEN_PACKING.md``.
+semantics documented in ``STATUS.md`` §"Cross-sequence varlen packing
+(Option A — mask-based)".
 
 Correctness oracle: the Python ``_mx_compiled_body_packed`` applied
 chunk-by-chunk in a Python loop, from ``flash_kda_mlx.optimized``. Same

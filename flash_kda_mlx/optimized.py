@@ -223,7 +223,8 @@ def _recurrence_body_packed(
 
     Leading axes ``[N, H, ...]``; ``active_mask`` is ``[N, 1, 1, 1]`` fp32
     keeping a per-sequence state frozen once ``chunk_idx`` exceeds its own
-    chunk count (see ``VARLEN_PACKING.md``). Returns ``(out_h, new_state)``.
+    chunk count (see ``STATUS.md`` §"Cross-sequence varlen packing
+    (Option A — mask-based)"). Returns ``(out_h, new_state)``.
     """
     state_bf = _q_bf16(state)
     state_bf_T = state_bf.transpose(0, 1, 3, 2)

@@ -283,9 +283,10 @@ chunk-size / kernel-decomposition / numerics narrative above:
   → no ULP drift). At `CHUNK=16, D=128` the cost per masked chunk is a
   handful of small matmuls over `[H, CHUNK, D]` — already cheap, and
   `mx.where` on the state update is a lane select rather than a
-  materialized buffer. Documented in `VARLEN_PACKING.md`; the analogous
-  Option B (sort-by-chunk-count) was considered and rejected because
-  the index-permutation it forces on outputs and final state pays back
+  materialized buffer. Documented in `STATUS.md` §"Cross-sequence
+  varlen packing (Option A — mask-based)"; the analogous Option B
+  (sort-by-chunk-count) was considered and rejected because the
+  index-permutation it forces on outputs and final state pays back
   most of the savings.
 
 - **`cu` device→host sync collapse (2026-04-30 hygiene PR).** In varlen
@@ -357,8 +358,6 @@ M3 Max.
 - `STATUS.md` — as-shipped state: PRs, measured tolerances, current
   benchmark numbers, divergences from CUDA.
 - `BENCHMARK_MLX.md` — current production benchmark table.
-- `VARLEN_PACKING.md` — Option A (mask-based) vs. Option B (sort) varlen
-  packing decision.
 - `benchmarks/section_timings_report.md` — section-level profile,
   per-PR A/B data, bottleneck attribution that gated each Metal kernel.
 - `flash_kda_mlx/reference.py` — pure-MLX correctness oracle, retained
