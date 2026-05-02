@@ -4,8 +4,9 @@ Standalone MLX / Metal implementation, tests, and benchmark reproduction
 harness for FlashKDA-style Kimi Delta Attention on Apple Silicon.
 
 This repository is intentionally independent from the original CUDA/CUTLASS
-FlashKDA source tree. It contains only the MLX package, MLX benchmark scripts,
-torch-reference parity fixtures, and MLX-side documentation.
+FlashKDA source tree ([MoonshotAI/FlashKDA](https://github.com/MoonshotAI/FlashKDA)).
+It contains only the MLX package, MLX benchmark scripts, torch-reference
+parity fixtures, and MLX-side documentation.
 
 ## Headline numbers (Apple M3 Max, MLX 0.31.2)
 
