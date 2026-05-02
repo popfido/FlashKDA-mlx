@@ -88,162 +88,23 @@ HAS_METAL_KERNEL: bool = (not _FORCE_FALLBACK) and _probe_m3_or_newer()
 
 
 # ---------------------------------------------------------------------------
-# Kernel source
+# Shared kernel source header
 # ---------------------------------------------------------------------------
 #
-# Phase 1 matmul kernel. Dispatch geometry:
-#
-#   grid        = (1024, H, 1)        # 1024 threads × H heads
-#   threadgroup = (1024, 1, 1)        # 32 simdgroups per threadgroup
-#
-# One threadgroup per head. 32 simdgroups cooperate on 32 output tiles
-# (CHUNK/8 × D/8 = 2 × 16 = 32). Each simdgroup computes one 8×8 output
-# tile via a K-loop of D/8 = 16 MMAs.
+# All cross-chunk kernels below share the same `_HEADER` (simdgroup_matrix
+# include + `using namespace metal`). The original Phase 1 standalone
+# matmul kernel (`metal_matmul_A_by_B` + `warmup_matmul_shapes` +
+# `_MATMUL_SOURCE` + `_build_matmul_kernel`) was retired in the
+# 2026-05-02 cleanup pass: it had no production callers — the cross-chunk
+# kernels (Phase 3a / 3b / 4 / flat-ragged) are dispatched directly from
+# `optimized.py` and do not depend on the Phase 1 single-matmul scaffold.
+# The optimization path Phase 1 → Phase 2 → Phase 3 remains documented in
+# `plan.md` §8.3.5 for design context.
 
 _HEADER = """
 #include <metal_simdgroup_matrix>
 using namespace metal;
 """
-
-
-_MATMUL_SOURCE = """
-    // Grid contract:
-    //   threadgroup_position_in_grid.y = head_id  (0..H-1)
-    //   threads_per_threadgroup.x      = 1024     (32 simdgroups)
-    //
-    // Each simdgroup owns one 8x8 output tile.
-    //   simd_id in [0, 32)
-    //   tile_r = simd_id / (D/8)  in {0, 1}
-    //   tile_c = simd_id % (D/8)  in [0, D/8)
-
-    uint head_id = threadgroup_position_in_grid.y;
-    uint simd_id = simdgroup_index_in_threadgroup;
-
-    // Compile-time per-shape constants (substituted via template params):
-    //   H, CHUNK, D are Metal template parameters baked at JIT time.
-    constexpr uint CHUNK_TILES = CHUNK / 8;   // 2 for CHUNK=16
-    constexpr uint D_TILES     = D / 8;       // 16 for D=128
-    constexpr uint K_TILES     = D / 8;       // K = D for this matmul
-
-    uint tile_r = simd_id / D_TILES;  // row-block of CHUNK
-    uint tile_c = simd_id % D_TILES;  // col-block of D
-
-    // Bounds: we have exactly CHUNK_TILES * D_TILES = 32 output tiles and
-    // 32 simdgroups per threadgroup, so every simdgroup has work. No
-    // guard needed for the common case; assert at kernel-build time.
-    static_assert(CHUNK_TILES * D_TILES <= 32,
-                  "Phase 1 kernel assumes one simdgroup per output tile");
-
-    // Per-head strided base pointers.
-    const device float* A_head = A + head_id * CHUNK * D;   // [CHUNK, D]
-    const device float* B_head = B + head_id * D * D;       // [D, D]
-    device float*       C_head = C + head_id * CHUNK * D;   // [CHUNK, D]
-
-    // Accumulator tile (fp32).
-    simdgroup_matrix<float, 8, 8> C_tile;
-    C_tile = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
-    // K-loop over D in 8-wide tiles.
-    for (uint k_tile = 0; k_tile < K_TILES; ++k_tile) {
-        simdgroup_matrix<float, 8, 8> A_tile;
-        simdgroup_matrix<float, 8, 8> B_tile;
-
-        // Load A[tile_r*8 : tile_r*8+8, k_tile*8 : k_tile*8+8]
-        // Source pointer is pre-offset to the top-left of the 8x8 tile.
-        const device float* A_src =
-            A_head + (tile_r * 8) * D + (k_tile * 8);
-        simdgroup_load(A_tile, A_src, D);
-
-        // Load B[k_tile*8 : k_tile*8+8, tile_c*8 : tile_c*8+8]
-        const device float* B_src =
-            B_head + (k_tile * 8) * D + (tile_c * 8);
-        simdgroup_load(B_tile, B_src, D);
-
-        // C_tile += A_tile @ B_tile
-        simdgroup_multiply_accumulate(C_tile, A_tile, B_tile, C_tile);
-    }
-
-    // Store C_tile to C[tile_r*8 : +8, tile_c*8 : +8]
-    device float* C_dst =
-        C_head + (tile_r * 8) * D + (tile_c * 8);
-    simdgroup_store(C_tile, C_dst, D);
-"""
-
-
-# ---------------------------------------------------------------------------
-# Kernel-factory cache
-# ---------------------------------------------------------------------------
-#
-# MLX compiles the shader on first dispatch for each unique
-# (name, source, header) triple AND (per mlx-lm observation) specializes
-# further per ``template`` combination. We cache the factory object per
-# (H, D, CHUNK) so Python-side dispatch overhead stays minimal.
-
-@lru_cache(maxsize=16)
-def _build_matmul_kernel(H: int, D: int, CHUNK: int):
-    del H, D, CHUNK  # baked via template at call time; kernel is generic
-    return mx.fast.metal_kernel(
-        name="flash_kda_phase1_matmul",
-        input_names=["A", "B"],
-        output_names=["C"],
-        header=_HEADER,
-        source=_MATMUL_SOURCE,
-        ensure_row_contiguous=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def metal_matmul_A_by_B(A: mx.array, B: mx.array) -> mx.array:
-    """Compute ``A @ B`` batched over the leading H axis.
-
-    Shapes:
-      A : ``[H, CHUNK, D]`` fp32
-      B : ``[H, D, D]`` fp32
-      returns ``[H, CHUNK, D]`` fp32
-    """
-    assert HAS_METAL_KERNEL, (
-        "metal_matmul_A_by_B called on non-M3+ hardware; "
-        "gate with HAS_METAL_KERNEL upstream."
-    )
-    assert A.dtype == mx.float32 and B.dtype == mx.float32
-    assert A.ndim == 3 and B.ndim == 3
-    H, CHUNK, D_a = A.shape
-    Hb, D_b, D_out = B.shape
-    assert H == Hb and D_a == D_b == D_out, (
-        f"shape mismatch: A={A.shape} B={B.shape}"
-    )
-
-    kernel = _build_matmul_kernel(H=H, D=D_a, CHUNK=CHUNK)
-
-    outputs = kernel(
-        inputs=[A, B],
-        template=[("H", H), ("CHUNK", CHUNK), ("D", D_a)],
-        grid=(1024, H, 1),
-        threadgroup=(1024, 1, 1),
-        output_shapes=[(H, CHUNK, D_a)],
-        output_dtypes=[mx.float32],
-    )
-    return outputs[0]
-
-
-def warmup_matmul_shapes(shapes: list[tuple[int, int, int]]) -> None:
-    """JIT-compile kernels for each ``(H, CHUNK, D)`` shape ahead of timing.
-
-    Phase 1 compile cost can be 500ms–2s per shape on first dispatch;
-    this helper runs a zero-input call for each shape so the bench
-    timing doesn't absorb that hit.
-    """
-    if not HAS_METAL_KERNEL:
-        return
-    for H, CHUNK, D in shapes:
-        A = mx.zeros((H, CHUNK, D), dtype=mx.float32)
-        B = mx.zeros((H, D, D), dtype=mx.float32)
-        out = metal_matmul_A_by_B(A, B)
-        mx.eval(out)
-
 
 
 # ---------------------------------------------------------------------------
@@ -1774,8 +1635,6 @@ def warmup_cross_chunk_flat_ragged_shapes(
 
 __all__ = [
     "HAS_METAL_KERNEL",
-    "metal_matmul_A_by_B",
-    "warmup_matmul_shapes",
     "metal_recurrence_cross_chunk_scalar",
     "warmup_cross_chunk_scalar_shapes",
     "metal_recurrence_cross_chunk_simdgroup",
