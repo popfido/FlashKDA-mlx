@@ -13,7 +13,7 @@ parity fixtures, and MLX-side documentation.
 `flash_kda_mlx` beats both MLX-LM-backed baselines on every bench-scale
 row at `T=8192`, `D=128`:
 
-| H | Case | `flash_kda_mlx` (ms) | vs `mlx_chunk_kda` | vs `mlx_chunk_gdn` |
+| Heads | Case | `flash_kda_mlx` (ms) | vs `mlx_chunk_kda` | vs `mlx_chunk_gdn` |
 |---:|---|---:|:---:|:---:|
 | 96 | Fixed | 49.8 | **4.86×** | **2.80×** |
 | 96 | Varlen, mixed `[1300, 547, 2048, 963, 271, 3063]` | 52.5 | **2.81×** | **1.68×** |
