@@ -38,6 +38,7 @@ shipped optimization track.
 - `benchmarks/`: MLX benchmark runners and report generator.
 - `scripts/`: torch oracle and fixture generation for MLX parity tests.
 - `BENCHMARK_MLX.md`: current Apple GPU benchmark report using the H20-shaped cases.
+- `docs/20260501-flashkda-mlx-v1-deep-dive.md`: design deep dive — chunk-size choice, two-kernel decomposition (prepare + cross-chunk recurrence), numerical-precision contract, and accuracy comparison vs. `mlx_chunk_kda`.
 - `plan.md`: consolidated TDD migration, optimization, and benchmark-reproduction plan.
 - `STATUS.md`: as-shipped state of the plan (current PR/phase status, measured tolerances, current benchmark numbers).
 
